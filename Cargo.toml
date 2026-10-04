@@ -1,0 +1,36 @@
+[package]
+name = "six_d_game_of_life"
+version = "0.1.0"
+edition = "2021"
+authors = ["foolvan"]
+description = "High-performance Rust port of 6D Game of Life with wgpu 3D renderer and egui"
+
+[dependencies]
+rayon = "1.10"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+crossbeam-channel = "0.5"
+
+# Rendering, Windowing and UI
+wgpu = "30"
+winit = "0.30"
+egui = "0.36"
+egui-wgpu = { version = "0.36", features = ["winit"] }
+egui-winit = "0.36"
+bytemuck = { version = "1.25", features = ["derive"] }
+glam = "0.34"
+pollster = "0.4"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.4"
+
+[[bench]]
+name = "simulation_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

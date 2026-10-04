@@ -1,0 +1,7 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# macOS system files
+.DS_Store
+**/.DS_Store
