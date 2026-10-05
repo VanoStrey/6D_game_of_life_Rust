@@ -7,6 +7,7 @@ pub struct UiConfig {
     pub delta: usize,
     pub percent_min: f64,
     pub percent_max: f64,
+    pub periodic: bool,
     pub is_playing: bool,
     pub speed_fps: f32,
     pub color_mode: ColorMode,
@@ -21,6 +22,7 @@ impl Default for UiConfig {
             delta: 3,
             percent_min: 20.0,
             percent_max: 45.0,
+            periodic: true,
             is_playing: false,
             speed_fps: 5.0,
             color_mode: ColorMode::Hyperdimension,
@@ -56,6 +58,21 @@ pub fn max_size_for_dimensions(dim: usize, unlock_extreme: bool) -> usize {
     }
 }
 
+/// Information about a saved dump file on disk.
+#[derive(Debug, Clone)]
+pub struct DumpFileInfo {
+    pub path: std::path::PathBuf,
+    pub filename: String,
+    pub size_bytes: u64,
+}
+
+/// Dynamic UI state for dump operations and feedback.
+#[derive(Debug, Clone, Default)]
+pub struct UiDumpState {
+    pub last_status: Option<(String, bool)>,
+    pub recent_dumps: Vec<DumpFileInfo>,
+}
+
 #[derive(Debug, Default)]
 pub struct UiActions {
     pub reconfigure: bool,
@@ -65,6 +82,10 @@ pub struct UiActions {
     pub switch_dimension: Option<usize>,
     pub toggle_playing: bool,
     pub color_mode_changed: bool,
+    pub export_dump_quick: bool,
+    pub export_dump_dialog: bool,
+    pub import_dump_dialog: bool,
+    pub import_dump_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
@@ -99,8 +120,44 @@ pub struct UiStats {
     pub status: AppSimStatus,
 }
 
-pub fn render_ui(ctx: &egui::Context, config: &mut UiConfig, stats: &UiStats) -> UiActions {
+pub fn render_ui(
+    ctx: &egui::Context,
+    config: &mut UiConfig,
+    stats: &UiStats,
+    dump_state: &UiDumpState,
+    is_mouse_captured: bool,
+) -> UiActions {
     let mut actions = UiActions::default();
+
+    if is_mouse_captured {
+        egui::Area::new(egui::Id::new("mouselook_hud"))
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 16.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgba_premultiplied(12, 18, 30, 230))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 160, 255)))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("🎮 РЕЖИМ КАМЕРЫ")
+                                    .color(egui::Color32::from_rgb(100, 220, 255))
+                                    .strong(),
+                            );
+                            ui.label("• Двигайте мышь для поворота");
+                            ui.label("• WASD: полёт");
+                            ui.label(
+                                egui::RichText::new("[Esc]")
+                                    .color(egui::Color32::from_rgb(255, 220, 100))
+                                    .strong(),
+                            );
+                            ui.label("вернуть курсор");
+                        });
+                    });
+            });
+    }
 
     egui::Window::new("6D Game of Life Controls")
         .default_pos([16.0, 16.0])
@@ -108,12 +165,35 @@ pub fn render_ui(ctx: &egui::Context, config: &mut UiConfig, stats: &UiStats) ->
         .resizable(true)
         .show(ctx, |ui| {
             ui.heading("Симуляция 6D Жизни");
+            if config.periodic {
+                ui.label(
+                    egui::RichText::new("🌐 Топология: Периодический n-тор (T^D / PBC)")
+                        .color(egui::Color32::from_rgb(100, 200, 255))
+                        .small(),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("⬛ Топология: Ограниченное пространство (Hard Bounds)")
+                        .color(egui::Color32::from_rgb(255, 180, 100))
+                        .small(),
+                );
+            }
             ui.label(format!(
                 "Поколение: {} | FPS: {:.1}",
                 stats.generation, stats.fps
             ));
 
-            ui.label(format!("Статус: {}", stats.status.as_str()));
+            ui.horizontal(|ui| {
+                ui.label(format!("Статус: {}", stats.status.as_str()));
+            });
+
+            if ui
+                .checkbox(&mut config.periodic, "🌐 Периодический тор (PBC)")
+                .on_hover_text("Включить тороидальное замыкание границ (T^D = S^1 x ... x S^1). Снимите галочку для ограниченного пространства с нулевыми границами.")
+                .changed()
+            {
+                actions.reconfigure = true;
+            }
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -133,6 +213,18 @@ pub fn render_ui(ctx: &egui::Context, config: &mut UiConfig, stats: &UiStats) ->
                 }
                 if ui.button("🎲 Рандом (R)").clicked() {
                     actions.randomize = true;
+                }
+                let can_dump = !config.is_playing;
+                if ui
+                    .add_enabled(can_dump, egui::Button::new("💾 Дамп"))
+                    .on_hover_text(if can_dump {
+                        "Создать быстрый дамп текущего состояния в папку dumps/"
+                    } else {
+                        "Для создания дампа поставьте симуляцию на паузу (P)"
+                    })
+                    .clicked()
+                {
+                    actions.export_dump_quick = true;
                 }
             });
 
@@ -259,6 +351,18 @@ pub fn render_ui(ctx: &egui::Context, config: &mut UiConfig, stats: &UiStats) ->
 
                 ui.separator();
                 if ui
+                    .checkbox(
+                        &mut config.periodic,
+                        "🌐 Периодический n-тор (PBC)",
+                    )
+                    .on_hover_text("Включить тороидальное замыкание границ (T^D = S^1 x ... x S^1).\nЕсли выключено — ограниченное n-мерное пространство с жесткими/нулевыми границами.")
+                    .changed()
+                {
+                    changed = true;
+                }
+
+                ui.separator();
+                if ui
                     .add(
                         egui::Slider::new(&mut config.percent_min, 0.0..=100.0)
                             .text("Мин. соседи %"),
@@ -286,6 +390,99 @@ pub fn render_ui(ctx: &egui::Context, config: &mut UiConfig, stats: &UiStats) ->
                         .weak()
                         .small(),
                 );
+            });
+
+            ui.separator();
+            ui.collapsing("💾 Дамп состояния (Экспорт / Импорт)", |ui| {
+                ui.horizontal(|ui| {
+                    if config.is_playing {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 180, 80),
+                            "⏸ Нажмите Паузу (P) для создания дампа",
+                        );
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(100, 220, 120),
+                            "⏸ Симуляция на паузе — сохранение доступно",
+                        );
+                    }
+                });
+
+                ui.add_space(4.0);
+                let can_export = !config.is_playing;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_export, egui::Button::new("💾 Быстрый дамп (в dumps/)"))
+                        .on_hover_text(if can_export {
+                            "Сохранить параметры и клетки в файл с максимальным сжатием (.gol6d)"
+                        } else {
+                            "Для создания дампа поставьте симуляцию на паузу (P)"
+                        })
+                        .clicked()
+                    {
+                        actions.export_dump_quick = true;
+                    }
+
+                    if ui
+                        .add_enabled(can_export, egui::Button::new("💾 Сохранить как..."))
+                        .on_hover_text("Выбрать путь и имя файла для сохранения дампа (.gol6d)")
+                        .clicked()
+                    {
+                        actions.export_dump_dialog = true;
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("📂 Загрузить файл дампа...")
+                        .on_hover_text("Выбрать и загрузить файл дампа (.gol6d) через диалог выбора файлов")
+                        .clicked()
+                    {
+                        actions.import_dump_dialog = true;
+                    }
+                });
+
+                if let Some((msg, is_err)) = &dump_state.last_status {
+                    ui.add_space(4.0);
+                    let color = if *is_err {
+                        egui::Color32::from_rgb(255, 110, 110)
+                    } else {
+                        egui::Color32::from_rgb(100, 230, 130)
+                    };
+                    ui.colored_label(color, msg);
+                }
+
+                if !dump_state.recent_dumps.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("📁 Недавние дампы в dumps/:").strong().small());
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            for item in &dump_state.recent_dumps {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("📥 Загрузить").clicked() {
+                                        actions.import_dump_path = Some(item.path.clone());
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(&item.filename)
+                                            .monospace()
+                                            .small(),
+                                    );
+                                    let size_str = if item.size_bytes >= 1024 {
+                                        format!("{:.1} КБ", item.size_bytes as f64 / 1024.0)
+                                    } else {
+                                        format!("{} Б", item.size_bytes)
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format!("({})", size_str))
+                                            .weak()
+                                            .small(),
+                                    );
+                                });
+                            }
+                        });
+                }
             });
 
             ui.separator();
@@ -321,12 +518,14 @@ pub fn render_ui(ctx: &egui::Context, config: &mut UiConfig, stats: &UiStats) ->
 
             ui.separator();
             ui.collapsing("Управление", |ui| {
-                ui.label("🎮 Камера (как в Unity Editor):");
+                ui.label("🎮 Камера (как в видеоиграх):");
+                ui.label("  • Клик вне панели: Вход в режим обзора (курсор скроется)");
+                ui.label("  • Движение мыши: Свободный поворот камеры (без зажатия кнопок)");
                 ui.label("  • W / S: Вперед / Назад (по направлению взгляда)");
                 ui.label("  • A / D: Стрейф влево / вправо");
                 ui.label("  • Пробел (Space) / E: Вверх");
                 ui.label("  • Shift / Q: Вниз");
-                ui.label("  • Зажатая ЛКМ / ПКМ + мышь: Свободный обзор");
+                ui.label("  • Esc: Выход из режима обзора и возврат курсора");
                 ui.separator();
                 ui.label("⚡ Горячие клавиши симуляции:");
                 ui.label("  • P: Старт / Пауза (Play/Pause)");

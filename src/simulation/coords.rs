@@ -162,6 +162,39 @@ impl GridDimensions {
         }
         true
     }
+
+    /// Wraps 6D signed coordinates periodically according to the torus topology T^D.
+    #[inline(always)]
+    pub fn wrap_coords_6d(&self, a: isize, b: isize, c: isize, d: isize, e: isize, f: isize) -> Coords6D {
+        (
+            wrap_coord(a, self.size_in_dimensions[5]),
+            wrap_coord(b, self.size_in_dimensions[4]),
+            wrap_coord(c, self.size_in_dimensions[3]),
+            wrap_coord(d, self.size_in_dimensions[2]),
+            wrap_coord(e, self.size_in_dimensions[1]),
+            wrap_coord(f, self.size_in_dimensions[0]),
+        )
+    }
+
+    /// Wraps N-dimensional signed coordinates periodically according to the torus topology T^D.
+    #[inline(always)]
+    pub fn wrap_coords_nd(&self, in_coords: &[isize], out_coords: &mut [usize]) {
+        for (dim, &c) in in_coords.iter().enumerate().take(self.dimensions) {
+            out_coords[dim] = wrap_coord(c, self.size_in_dimensions[dim]);
+        }
+    }
+}
+
+/// Wraps a signed coordinate into the range `[0, size)` using Euclidean modulo.
+///
+/// Mathematical properties for Periodic Boundary Conditions (PBC):
+/// - `wrap_coord(-1, size) == size - 1`
+/// - `wrap_coord(size, size) == 0`
+/// - `wrap_coord(0, size) == 0`
+#[inline(always)]
+pub fn wrap_coord(coord: isize, size: usize) -> usize {
+    debug_assert!(size > 0);
+    coord.rem_euclid(size as isize) as usize
 }
 
 #[cfg(test)]
@@ -232,5 +265,32 @@ mod tests {
     fn test_fallback_dimensions() {
         assert_eq!(GridDimensions::new(5, 0).dimensions, 6);
         assert_eq!(GridDimensions::new(5, 7).dimensions, 6);
+    }
+
+    #[test]
+    fn test_periodic_wrapping() {
+        let size = 6;
+        assert_eq!(wrap_coord(-1, size), 5);
+        assert_eq!(wrap_coord(0, size), 0);
+        assert_eq!(wrap_coord(5, size), 5);
+        assert_eq!(wrap_coord(6, size), 0);
+        assert_eq!(wrap_coord(7, size), 1);
+        assert_eq!(wrap_coord(-6, size), 0);
+        assert_eq!(wrap_coord(-7, size), 5);
+
+        // size = 1
+        assert_eq!(wrap_coord(-1, 1), 0);
+        assert_eq!(wrap_coord(0, 1), 0);
+        assert_eq!(wrap_coord(1, 1), 0);
+
+        // size = 2
+        assert_eq!(wrap_coord(-1, 2), 1);
+        assert_eq!(wrap_coord(0, 2), 0);
+        assert_eq!(wrap_coord(1, 2), 1);
+        assert_eq!(wrap_coord(2, 2), 0);
+
+        let dims = GridDimensions::new(6, 6);
+        let wrapped = dims.wrap_coords_6d(-1, 0, 5, 6, -6, 7);
+        assert_eq!(wrapped, (5, 0, 5, 0, 0, 1));
     }
 }

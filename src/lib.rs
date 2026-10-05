@@ -17,7 +17,8 @@ pub use renderer::{
     InstanceRaw,
 };
 pub use simulation::{
-    Coords6D, Grid, GridDimensions, Rules, Simulation, SimulationCommand, SimulationSnapshot,
-    SimulationWorker,
+    compute_cell_state_reference, compute_cell_state_reference_with_topology, step_reference,
+    step_reference_with_topology, wrap_coord, Coords6D, DumpError, Grid, GridDimensions, Rules,
+    Simulation, SimulationCommand, SimulationDump, SimulationSnapshot, SimulationWorker,
 };
 pub use ui::{render_ui, AppSimStatus, UiActions, UiConfig, UiStats};

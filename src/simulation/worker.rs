@@ -15,7 +15,22 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::projection::{collect_alive_positions, VisualBounds};
-use crate::simulation::{Rules, Simulation};
+use crate::simulation::{Grid, Rules, Simulation};
+
+/// Complete simulation state snapshot exported from the background worker.
+#[derive(Debug, Clone)]
+pub struct ExportedSimulationState {
+    pub generation: u64,
+    pub dimensions: usize,
+    pub size: usize,
+    pub delta: usize,
+    pub percent_min: f64,
+    pub percent_max: f64,
+    pub periodic: bool,
+    pub total_cells: usize,
+    pub alive_count: usize,
+    pub grid: Grid,
+}
 
 /// Commands sent from the UI/render thread to the simulation worker.
 #[derive(Debug, Clone)]
@@ -28,7 +43,7 @@ pub enum SimulationCommand {
     SetSpeed(f32),
     /// Re-randomize the grid with an optional seed and reset generation to 0.
     Randomize { epoch: u64, seed: Option<u64> },
-    /// Reconfigure the hypergrid with new dimensions, size, rules and epoch.
+    /// Reconfigure the hypergrid with new dimensions, size, rules, topology and epoch.
     Reconfigure {
         epoch: u64,
         size: usize,
@@ -36,7 +51,21 @@ pub enum SimulationCommand {
         delta: usize,
         percent_min: f64,
         percent_max: f64,
+        periodic: bool,
         seed: Option<u64>,
+    },
+    /// Export the full current simulation state (grid, rules, generation, etc.).
+    ExportState {
+        reply_tx: Sender<Box<ExportedSimulationState>>,
+    },
+    /// Load a full simulation state into the worker thread.
+    LoadState {
+        epoch: u64,
+        delta: usize,
+        rules: Rules,
+        periodic: bool,
+        generation: u64,
+        grid: Grid,
     },
     /// Shutdown the background worker thread cleanly.
     Shutdown,
@@ -74,7 +103,7 @@ impl SimulationWorker {
     pub const DEFAULT_CMD_BOUND: usize = 32;
     pub const DEFAULT_RESULT_BOUND: usize = 2;
 
-    /// Spawns a new simulation worker with the given initial configuration.
+    /// Spawns a new simulation worker with default periodic boundary conditions.
     pub fn new(
         epoch: u64,
         size: usize,
@@ -84,12 +113,37 @@ impl SimulationWorker {
         seed: Option<u64>,
         speed_fps: f32,
     ) -> Self {
-        Self::with_bounds(
+        Self::new_with_topology(
             epoch,
             size,
             dimensions,
             delta,
             rules,
+            true,
+            seed,
+            speed_fps,
+        )
+    }
+
+    /// Spawns a new simulation worker with specified periodic boundary topology.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_topology(
+        epoch: u64,
+        size: usize,
+        dimensions: usize,
+        delta: usize,
+        rules: Rules,
+        periodic: bool,
+        seed: Option<u64>,
+        speed_fps: f32,
+    ) -> Self {
+        Self::with_bounds_and_topology(
+            epoch,
+            size,
+            dimensions,
+            delta,
+            rules,
+            periodic,
             seed,
             speed_fps,
             Self::DEFAULT_CMD_BOUND,
@@ -97,13 +151,42 @@ impl SimulationWorker {
         )
     }
 
-    /// Spawns a worker with custom channel bounds.
+    /// Spawns a worker with custom channel bounds and default periodic boundary conditions.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_bounds(
         epoch: u64,
         size: usize,
         dimensions: usize,
         delta: usize,
         rules: Rules,
+        seed: Option<u64>,
+        speed_fps: f32,
+        cmd_bound: usize,
+        result_bound: usize,
+    ) -> Self {
+        Self::with_bounds_and_topology(
+            epoch,
+            size,
+            dimensions,
+            delta,
+            rules,
+            true,
+            seed,
+            speed_fps,
+            cmd_bound,
+            result_bound,
+        )
+    }
+
+    /// Spawns a worker with custom channel bounds and topology.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_bounds_and_topology(
+        epoch: u64,
+        size: usize,
+        dimensions: usize,
+        delta: usize,
+        rules: Rules,
+        periodic: bool,
         seed: Option<u64>,
         speed_fps: f32,
         cmd_bound: usize,
@@ -124,6 +207,7 @@ impl SimulationWorker {
                     dimensions,
                     delta,
                     rules,
+                    periodic,
                     seed,
                     speed_fps,
                     is_computing_clone,
@@ -157,9 +241,11 @@ impl SimulationWorker {
             Err(TrySendError::Full(cmd)) => match cmd {
                 SimulationCommand::Shutdown
                 | SimulationCommand::Reconfigure { .. }
-                | SimulationCommand::Randomize { .. } => self
+                | SimulationCommand::Randomize { .. }
+                | SimulationCommand::LoadState { .. }
+                | SimulationCommand::ExportState { .. } => self
                     .cmd_tx
-                    .send_timeout(cmd, Duration::from_millis(5))
+                    .send_timeout(cmd, Duration::from_millis(50))
                     .is_ok(),
                 _ => false, // Drop intermediate rate-limited slider or burst commands
             },
@@ -192,7 +278,8 @@ impl SimulationWorker {
         self.send_command(SimulationCommand::Randomize { epoch, seed })
     }
 
-    /// Reconfigures grid parameters, dimension, rules and epoch.
+    /// Reconfigures grid parameters, dimension, rules and epoch with default periodic boundary conditions.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconfigure(
         &self,
         epoch: u64,
@@ -203,6 +290,31 @@ impl SimulationWorker {
         percent_max: f64,
         seed: Option<u64>,
     ) -> bool {
+        self.reconfigure_with_topology(
+            epoch,
+            size,
+            dimensions,
+            delta,
+            percent_min,
+            percent_max,
+            true,
+            seed,
+        )
+    }
+
+    /// Reconfigures grid parameters, dimension, rules, boundary topology and epoch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconfigure_with_topology(
+        &self,
+        epoch: u64,
+        size: usize,
+        dimensions: usize,
+        delta: usize,
+        percent_min: f64,
+        percent_max: f64,
+        periodic: bool,
+        seed: Option<u64>,
+    ) -> bool {
         self.send_command(SimulationCommand::Reconfigure {
             epoch,
             size,
@@ -210,7 +322,45 @@ impl SimulationWorker {
             delta,
             percent_min,
             percent_max,
+            periodic,
             seed,
+        })
+    }
+
+    /// Exports the current simulation state from the worker thread.
+    pub fn export_state(&self, timeout: Duration) -> Result<ExportedSimulationState, String> {
+        let (reply_tx, reply_rx) = bounded(1);
+        if !self.send_command(SimulationCommand::ExportState { reply_tx }) {
+            return Err("Worker command channel full or disconnected".to_string());
+        }
+        match reply_rx.recv_timeout(timeout) {
+            Ok(state) => Ok(*state),
+            Err(RecvTimeoutError::Timeout) => {
+                Err("Timed out waiting for state export from worker thread".to_string())
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                Err("Worker thread disconnected while waiting for state export".to_string())
+            }
+        }
+    }
+
+    /// Loads a full simulation state into the worker thread.
+    pub fn load_state(
+        &self,
+        epoch: u64,
+        delta: usize,
+        rules: Rules,
+        periodic: bool,
+        generation: u64,
+        grid: Grid,
+    ) -> bool {
+        self.send_command(SimulationCommand::LoadState {
+            epoch,
+            delta,
+            rules,
+            periodic,
+            generation,
+            grid,
         })
     }
 
@@ -244,6 +394,22 @@ struct WorkerContext {
 }
 
 impl WorkerContext {
+    /// Builds an exported state snapshot representing current simulation and grid data.
+    fn make_exported_state(&self) -> Box<ExportedSimulationState> {
+        Box::new(ExportedSimulationState {
+            generation: self.simulation.generation,
+            dimensions: self.simulation.current.dims.dimensions,
+            size: self.simulation.current.dims.size,
+            delta: self.delta,
+            percent_min: self.simulation.rules.percent_min_neighbors,
+            percent_max: self.simulation.rules.percent_max_neighbors,
+            periodic: self.simulation.periodic,
+            total_cells: self.simulation.current.len(),
+            alive_count: self.simulation.current.count_alive(),
+            grid: self.simulation.current.clone(),
+        })
+    }
+
     /// Builds an immutable snapshot representing current state.
     fn make_snapshot(&self, step_time_ms: f64) -> SimulationSnapshot {
         let total_alive = self.simulation.current.count_alive();
@@ -291,12 +457,14 @@ impl WorkerContext {
 }
 
 /// Background worker loop.
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     initial_epoch: u64,
     initial_size: usize,
     initial_dimensions: usize,
     initial_delta: usize,
     initial_rules: Rules,
+    initial_periodic: bool,
     initial_seed: Option<u64>,
     initial_speed_fps: f32,
     is_computing: Arc<AtomicBool>,
@@ -304,7 +472,12 @@ fn worker_loop(
     result_tx: Sender<SimulationSnapshot>,
 ) {
     let mut rng = StdRng::seed_from_u64(initial_seed.unwrap_or(42));
-    let mut simulation = Simulation::new(initial_size, initial_dimensions, initial_rules);
+    let mut simulation = Simulation::new_with_topology(
+        initial_size,
+        initial_dimensions,
+        initial_rules,
+        initial_periodic,
+    );
     simulation.randomize(&mut rng);
 
     let mut ctx = WorkerContext {
@@ -347,13 +520,14 @@ fn worker_loop(
                             delta: new_delta,
                             percent_min,
                             percent_max,
+                            periodic,
                             seed,
                         }) => {
                             // Discard obsolete pending snapshot from old configuration!
                             ctx.epoch = new_epoch;
                             ctx.delta = new_delta;
                             let rules = Rules::new(percent_min, percent_max);
-                            ctx.simulation.reconfigure(size, dimensions, rules);
+                            ctx.simulation.reconfigure_with_topology(size, dimensions, rules, periodic);
                             if let Some(s) = seed {
                                 ctx.rng = StdRng::seed_from_u64(s);
                             }
@@ -372,6 +546,29 @@ fn worker_loop(
                             }
                             ctx.simulation.randomize(&mut ctx.rng);
                             ctx.simulation.generation = 0;
+                            let interval = Duration::from_secs_f32(1.0 / ctx.speed_fps.max(0.1));
+                            ctx.next_step_time = Instant::now() + interval;
+                            let snap0 = ctx.make_snapshot(0.0);
+                            if !ctx.deliver_or_queue_snapshot(snap0, &result_tx) {
+                                break;
+                            }
+                        }
+                        Ok(SimulationCommand::ExportState { reply_tx }) => {
+                            let _ = reply_tx.send(ctx.make_exported_state());
+                            ctx.pending_snapshot = Some(pending);
+                        }
+                        Ok(SimulationCommand::LoadState {
+                            epoch: new_epoch,
+                            delta: new_delta,
+                            rules,
+                            periodic,
+                            generation,
+                            grid,
+                        }) => {
+                            ctx.epoch = new_epoch;
+                            ctx.delta = new_delta;
+                            ctx.simulation = Simulation::from_grid_with_topology(grid, rules, periodic);
+                            ctx.simulation.generation = generation;
                             let interval = Duration::from_secs_f32(1.0 / ctx.speed_fps.max(0.1));
                             ctx.next_step_time = Instant::now() + interval;
                             let snap0 = ctx.make_snapshot(0.0);
@@ -442,15 +639,36 @@ fn worker_loop(
                     delta: new_delta,
                     percent_min,
                     percent_max,
+                    periodic,
                     seed,
                 }) => {
                     ctx.epoch = new_epoch;
                     ctx.delta = new_delta;
                     let rules = Rules::new(percent_min, percent_max);
-                    ctx.simulation.reconfigure(size, dimensions, rules);
+                    ctx.simulation.reconfigure_with_topology(size, dimensions, rules, periodic);
                     if let Some(s) = seed {
                         ctx.rng = StdRng::seed_from_u64(s);
                     }
+                    let snap0 = ctx.make_snapshot(0.0);
+                    if !ctx.deliver_or_queue_snapshot(snap0, &result_tx) {
+                        break;
+                    }
+                }
+                Ok(SimulationCommand::ExportState { reply_tx }) => {
+                    let _ = reply_tx.send(ctx.make_exported_state());
+                }
+                Ok(SimulationCommand::LoadState {
+                    epoch: new_epoch,
+                    delta: new_delta,
+                    rules,
+                    periodic,
+                    generation,
+                    grid,
+                }) => {
+                    ctx.epoch = new_epoch;
+                    ctx.delta = new_delta;
+                    ctx.simulation = Simulation::from_grid_with_topology(grid, rules, periodic);
+                    ctx.simulation.generation = generation;
                     let snap0 = ctx.make_snapshot(0.0);
                     if !ctx.deliver_or_queue_snapshot(snap0, &result_tx) {
                         break;
@@ -524,16 +742,36 @@ fn worker_loop(
                         delta: new_delta,
                         percent_min,
                         percent_max,
+                        periodic,
                         seed,
                     }) => {
                         ctx.epoch = new_epoch;
                         ctx.delta = new_delta;
                         let rules = Rules::new(percent_min, percent_max);
-                        ctx.simulation = Simulation::new(size, dimensions, rules);
+                        ctx.simulation.reconfigure_with_topology(size, dimensions, rules, periodic);
                         if let Some(s) = seed {
                             ctx.rng = StdRng::seed_from_u64(s);
                         }
-                        ctx.simulation.randomize(&mut ctx.rng);
+                        let snap0 = ctx.make_snapshot(0.0);
+                        if !ctx.deliver_or_queue_snapshot(snap0, &result_tx) {
+                            break;
+                        }
+                    }
+                    Ok(SimulationCommand::ExportState { reply_tx }) => {
+                        let _ = reply_tx.send(ctx.make_exported_state());
+                    }
+                    Ok(SimulationCommand::LoadState {
+                        epoch: new_epoch,
+                        delta: new_delta,
+                        rules,
+                        periodic,
+                        generation,
+                        grid,
+                    }) => {
+                        ctx.epoch = new_epoch;
+                        ctx.delta = new_delta;
+                        ctx.simulation = Simulation::from_grid_with_topology(grid, rules, periodic);
+                        ctx.simulation.generation = generation;
                         let snap0 = ctx.make_snapshot(0.0);
                         if !ctx.deliver_or_queue_snapshot(snap0, &result_tx) {
                             break;

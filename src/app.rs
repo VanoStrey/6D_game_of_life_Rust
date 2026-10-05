@@ -1,23 +1,59 @@
 //! Main Application coordinating Simulation Worker, WGPU Renderer, Winit and Egui.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::KeyCode;
-use winit::window::{WindowAttributes, WindowId};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{CursorGrabMode, WindowAttributes, WindowId};
 
 use crate::input::InputState;
 use crate::projection::VisualBounds;
 use crate::renderer::{create_instances_with_coloring, Camera, GpuState};
-use crate::simulation::{GridDimensions, Rules, SimulationSnapshot, SimulationWorker};
-use crate::ui::{max_size_for_dimensions, render_ui, AppSimStatus, UiActions, UiConfig, UiStats};
+use crate::simulation::{
+    GridDimensions, Rules, SimulationDump, SimulationSnapshot, SimulationWorker,
+};
+use crate::ui::{
+    max_size_for_dimensions, render_ui, AppSimStatus, DumpFileInfo, UiActions, UiConfig,
+    UiDumpState, UiStats,
+};
 
 const CUBE_SIZE: f32 = 100.0;
+
+/// Scans the `dumps/` directory for existing `.gol6d` simulation dump files.
+fn scan_dumps_dir() -> Vec<DumpFileInfo> {
+    let dumps_dir = Path::new("dumps");
+    if !dumps_dir.exists() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dumps_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "gol6d") {
+                if let Ok(meta) = entry.metadata() {
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    files.push(DumpFileInfo {
+                        path,
+                        filename: name,
+                        size_bytes: meta.len(),
+                    });
+                }
+            }
+        }
+    }
+    files.sort_by(|a, b| b.filename.cmp(&a.filename));
+    files
+}
 
 pub struct App<'window> {
     gpu_state: Option<GpuState<'window>>,
@@ -34,7 +70,10 @@ pub struct App<'window> {
     input_state: InputState,
     ui_config: UiConfig,
     ui_stats: UiStats,
+    dump_state: UiDumpState,
+    is_mouse_captured: bool,
     last_speed_fps: f32,
+    last_dumps_scan: Instant,
 
     rng: StdRng,
     last_frame_time: Instant,
@@ -74,6 +113,14 @@ impl<'window> App<'window> {
             status: AppSimStatus::Paused,
         };
 
+        let dump_state = UiDumpState {
+            last_status: None,
+            recent_dumps: scan_dumps_dir(),
+        };
+
+        let mut camera = Camera::default();
+        camera.frame_bounds((bounds.size_x, bounds.size_y, bounds.size_z), CUBE_SIZE);
+
         Self {
             gpu_state: None,
             egui_ctx: egui::Context::default(),
@@ -85,11 +132,14 @@ impl<'window> App<'window> {
             latest_snapshot: None,
             is_reconfiguring: false,
 
-            camera: Camera::default(),
+            camera,
             input_state: InputState::new(),
             last_speed_fps: ui_config.speed_fps,
+            last_dumps_scan: Instant::now(),
             ui_config,
             ui_stats,
+            dump_state,
+            is_mouse_captured: false,
 
             rng: StdRng::seed_from_u64(seed),
             last_frame_time: Instant::now(),
@@ -103,7 +153,6 @@ impl<'window> App<'window> {
     /// Updates stats and GPU instance buffer with the freshest snapshot matching current_epoch.
     fn drain_worker_snapshots(&mut self) {
         let mut latest_valid: Option<SimulationSnapshot> = None;
-
         while let Ok(snapshot) = self.worker.try_recv_snapshot() {
             if snapshot.epoch == self.current_epoch {
                 latest_valid = Some(snapshot);
@@ -139,16 +188,18 @@ impl<'window> App<'window> {
         self.current_epoch += 1;
         self.is_reconfiguring = true;
         let seed = self.rng.gen();
-        self.worker.reconfigure(
+        self.worker.reconfigure_with_topology(
             self.current_epoch,
             self.ui_config.size,
             self.ui_config.dimensions,
             self.ui_config.delta,
             self.ui_config.percent_min,
             self.ui_config.percent_max,
+            self.ui_config.periodic,
             Some(seed),
         );
 
+        let prev_bounds = self.ui_stats.visual_bounds;
         let dims = GridDimensions::new(self.ui_config.size, self.ui_config.dimensions);
         let bounds = VisualBounds::compute(
             dims.dimensions,
@@ -156,7 +207,27 @@ impl<'window> App<'window> {
             self.ui_config.delta,
         );
         self.ui_stats.visual_bounds = (bounds.size_x, bounds.size_y, bounds.size_z);
-        self.camera.frame_bounds((bounds.size_x, bounds.size_y, bounds.size_z), CUBE_SIZE);
+
+        // Keep the individual cell's visual size on screen invariant across dimension/size adjustments!
+        // We shift camera position by the relative change in bounding box center,
+        // without resetting camera distance or viewing angles.
+        let prev_center = glam::Vec3::new(
+            (prev_bounds.0 as f32) * CUBE_SIZE * 0.5,
+            (prev_bounds.1 as f32) * CUBE_SIZE * 0.5,
+            (prev_bounds.2 as f32) * CUBE_SIZE * 0.5,
+        );
+        let new_center = glam::Vec3::new(
+            (bounds.size_x as f32) * CUBE_SIZE * 0.5,
+            (bounds.size_y as f32) * CUBE_SIZE * 0.5,
+            (bounds.size_z as f32) * CUBE_SIZE * 0.5,
+        );
+        let offset = new_center - prev_center;
+        self.camera.position += offset;
+
+        let max_dim = ((bounds.size_x.max(bounds.size_y).max(bounds.size_z) as f32) * CUBE_SIZE).max(100.0);
+        self.camera.z_far = (max_dim * 12.0).max(100_000.0);
+        self.camera.speed_movement = (max_dim * 0.005).clamp(10.0, 1000.0);
+
         self.ui_stats.total_cells = dims.total_cells;
         self.ui_stats.generation = 0;
     }
@@ -168,6 +239,165 @@ impl<'window> App<'window> {
         let seed = self.rng.gen();
         self.worker.randomize(self.current_epoch, Some(seed));
         self.ui_stats.generation = 0;
+    }
+
+    /// Exports the current simulation state to a .gol6d file.
+    /// If `target_path` is None, generates a timestamped file in the `dumps/` directory.
+    pub fn export_state_to_file(
+        &mut self,
+        target_path: Option<PathBuf>,
+    ) -> Result<PathBuf, String> {
+        if self.ui_config.is_playing {
+            let msg = "Дамп можно создать только во время паузы!".to_string();
+            self.dump_state.last_status = Some((msg.clone(), true));
+            return Err(msg);
+        }
+
+        let exp = self
+            .worker
+            .export_state(Duration::from_millis(500))
+            .map_err(|e| {
+                let msg = format!("Ошибка экспорта: {}", e);
+                self.dump_state.last_status = Some((msg.clone(), true));
+                msg
+            })?;
+
+        let dump = SimulationDump {
+            dimensions: exp.dimensions,
+            size: exp.size,
+            delta: exp.delta,
+            percent_min: exp.percent_min,
+            percent_max: exp.percent_max,
+            periodic: exp.periodic,
+            color_mode: self.ui_config.color_mode,
+            generation: exp.generation,
+            total_cells: exp.total_cells,
+            alive_count: exp.alive_count,
+            grid: exp.grid,
+        };
+
+        let path = match target_path {
+            Some(p) => {
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                p
+            }
+            None => {
+                let _ = std::fs::create_dir_all("dumps");
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                PathBuf::from(format!(
+                    "dumps/dump_{}d_s{}_gen{}_{}.gol6d",
+                    dump.dimensions, dump.size, dump.generation, timestamp
+                ))
+            }
+        };
+
+        let bytes_written = dump.write_to_file(&path).map_err(|e| {
+            let msg = format!("Ошибка записи файла: {}", e);
+            self.dump_state.last_status = Some((msg.clone(), true));
+            msg
+        })?;
+
+        self.dump_state.recent_dumps = scan_dumps_dir();
+        let file_name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let msg = format!(
+            "Дамп сохранён: {} ({:.1} КБ, {} живых)",
+            file_name,
+            bytes_written as f64 / 1024.0,
+            dump.alive_count
+        );
+        self.dump_state.last_status = Some((msg, false));
+        Ok(path)
+    }
+
+    /// Imports simulation state from a .gol6d file.
+    pub fn import_state_from_file(&mut self, path: &Path) -> Result<String, String> {
+        let dump = SimulationDump::read_from_file(path).map_err(|e| {
+            let msg = format!("Ошибка чтения дампа: {}", e);
+            self.dump_state.last_status = Some((msg.clone(), true));
+            msg
+        })?;
+
+        self.ui_config.dimensions = dump.dimensions;
+        self.ui_config.size = dump.size;
+        self.ui_config.delta = dump.delta;
+        self.ui_config.percent_min = dump.percent_min;
+        self.ui_config.percent_max = dump.percent_max;
+        self.ui_config.periodic = dump.periodic;
+        self.ui_config.color_mode = dump.color_mode;
+        self.ui_config.is_playing = false;
+        self.worker.set_playing(false);
+
+        self.current_epoch += 1;
+        self.is_reconfiguring = true;
+        let rules = Rules::new(dump.percent_min, dump.percent_max);
+        self.worker.load_state(
+            self.current_epoch,
+            dump.delta,
+            rules,
+            dump.periodic,
+            dump.generation,
+            dump.grid,
+        );
+
+        let dims = GridDimensions::new(dump.size, dump.dimensions);
+        let bounds = VisualBounds::compute(dump.dimensions, dump.size, dump.delta);
+        self.ui_stats.visual_bounds = (bounds.size_x, bounds.size_y, bounds.size_z);
+        self.ui_stats.total_cells = dims.total_cells;
+        self.ui_stats.generation = dump.generation;
+        self.ui_stats.alive_count = dump.alive_count;
+        self.ui_stats.instance_count = dump.alive_count;
+        self.ui_stats.status = AppSimStatus::Paused;
+
+        self.camera
+            .frame_bounds((bounds.size_x, bounds.size_y, bounds.size_z), CUBE_SIZE);
+
+        let file_name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let msg = format!(
+            "Дамп загружен: {} | {}D (N={}, Δ={}) | Поколение: {} | Живых: {}",
+            file_name, dump.dimensions, dump.size, dump.delta, dump.generation, dump.alive_count
+        );
+        self.dump_state.last_status = Some((msg.clone(), false));
+        self.dump_state.recent_dumps = scan_dumps_dir();
+        Ok(msg)
+    }
+
+    /// Enables or disables video game mouselook mode.
+    /// When captured, cursor is hidden and locked, and mouse movement directly rotates camera.
+    /// Pressing Escape exits this mode.
+    pub fn set_mouse_captured(&mut self, captured: bool) {
+        if self.is_mouse_captured == captured {
+            return;
+        }
+        self.is_mouse_captured = captured;
+        self.input_state.is_mouse_captured = captured;
+        self.input_state.last_cursor_pos = None;
+
+        if let Some(gpu) = &self.gpu_state {
+            let window = &gpu.window;
+            if captured {
+                window.set_cursor_visible(false);
+                let _ = window
+                    .set_cursor_grab(CursorGrabMode::Locked)
+                    .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            } else {
+                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                window.set_cursor_visible(true);
+            }
+        }
+        self.input_state.clear_frame_deltas();
     }
 }
 
@@ -224,20 +454,67 @@ impl<'window> ApplicationHandler for App<'window> {
         }
     }
 
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        self.input_state.process_device_event(&event);
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let mut egui_consumed = false;
-        if let (Some(gpu), Some(egui_state)) = (&self.gpu_state, &mut self.egui_state) {
-            let response = egui_state.on_window_event(&gpu.window, &event);
-            egui_consumed = response.consumed;
+        // 1. If Escape is pressed while in captured camera mode, immediately exit camera mode
+        if let WindowEvent::KeyboardInput { ref event, .. } = event {
+            if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
+                if event.state == ElementState::Pressed && self.is_mouse_captured {
+                    self.set_mouse_captured(false);
+                    return;
+                }
+            }
         }
 
-        // Only process game input if egui hasn't captured it
-        if !egui_consumed {
+        // 2. If window loses focus, immediately release cursor
+        if let WindowEvent::Focused(false) = event {
+            if self.is_mouse_captured {
+                self.set_mouse_captured(false);
+            }
+        }
+
+        // 3. Process Egui window event (only when mouse is not captured so egui doesn't steal game input)
+        let mut egui_consumed = false;
+        if !self.is_mouse_captured {
+            if let (Some(gpu), Some(egui_state)) = (&self.gpu_state, &mut self.egui_state) {
+                let response = egui_state.on_window_event(&gpu.window, &event);
+                egui_consumed = response.consumed;
+            }
+        }
+
+        // 4. Click outside control panel enters video game mouselook mode
+        if let WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            button,
+            ..
+        } = event
+        {
+            if !self.is_mouse_captured && (button == MouseButton::Left || button == MouseButton::Right) {
+                let is_over_egui = egui_consumed
+                    || self.egui_ctx.is_pointer_over_egui()
+                    || self.egui_ctx.egui_wants_pointer_input();
+                if !is_over_egui {
+                    self.set_mouse_captured(true);
+                    return;
+                }
+            }
+        }
+
+        // 5. Only process game input if egui hasn't captured it (or if mouse is captured)
+        if !egui_consumed || self.is_mouse_captured {
             self.input_state.process_event(&event);
         }
 
@@ -316,8 +593,8 @@ impl<'window> ApplicationHandler for App<'window> {
                     self.camera.translate_relative(forward, right, up);
                 }
 
-                // 3. Camera updates from mouse drag
-                let (dx, dy) = self.input_state.mouse_drag_delta;
+                // 3. Camera updates from mouse (video game mouselook)
+                let (dx, dy) = self.input_state.effective_mouse_delta();
                 if dx != 0.0 || dy != 0.0 {
                     self.camera.rotate_mouse(dx, dy);
                 }
@@ -343,7 +620,8 @@ impl<'window> ApplicationHandler for App<'window> {
                 if self.input_state.is_key_just_pressed(KeyCode::KeyC)
                     || self.input_state.is_key_just_pressed(KeyCode::Home)
                 {
-                    self.camera.reset();
+                    let bounds = self.ui_stats.visual_bounds;
+                    self.camera.frame_bounds(bounds, CUBE_SIZE);
                 }
                 // 1..6 : Direct dimension switch
                 let dim_keys = [
@@ -364,6 +642,11 @@ impl<'window> ApplicationHandler for App<'window> {
                         self.reconfigure_simulation();
                         break;
                     }
+                }
+
+                // Escape: exit video game mouselook mode
+                if self.input_state.is_key_just_pressed(KeyCode::Escape) && self.is_mouse_captured {
+                    self.set_mouse_captured(false);
                 }
 
                 self.input_state.clear_frame_deltas();
@@ -400,6 +683,11 @@ impl<'window> ApplicationHandler for App<'window> {
                     .create_view(&wgpu::TextureViewDescriptor::default());
 
                 // 6. Run Egui UI (guaranteed that GPU frame is ready to render)
+                if self.last_dumps_scan.elapsed() > Duration::from_secs(3) {
+                    self.dump_state.recent_dumps = scan_dumps_dir();
+                    self.last_dumps_scan = Instant::now();
+                }
+
                 let raw_input = self
                     .egui_state
                     .as_mut()
@@ -410,7 +698,13 @@ impl<'window> ApplicationHandler for App<'window> {
 
                 let mut actions = UiActions::default();
                 let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-                    actions = render_ui(ui.ctx(), &mut config_clone, &stats_clone);
+                    actions = render_ui(
+                        ui.ctx(),
+                        &mut config_clone,
+                        &stats_clone,
+                        &self.dump_state,
+                        self.is_mouse_captured,
+                    );
                 });
 
                 self.ui_config = config_clone;
@@ -456,6 +750,32 @@ impl<'window> ApplicationHandler for App<'window> {
                         );
                         gpu.update_instances(&instances);
                     }
+                }
+                if actions.export_dump_quick {
+                    let _ = self.export_state_to_file(None);
+                }
+                if actions.export_dump_dialog {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("6D Game of Life Dump (*.gol6d)", &["gol6d"])
+                        .set_file_name(&format!(
+                            "dump_{}d_s{}_gen{}.gol6d",
+                            self.ui_config.dimensions, self.ui_config.size, self.ui_stats.generation
+                        ))
+                        .save_file()
+                    {
+                        let _ = self.export_state_to_file(Some(path));
+                    }
+                }
+                if actions.import_dump_dialog {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("6D Game of Life Dump (*.gol6d)", &["gol6d"])
+                        .pick_file()
+                    {
+                        let _ = self.import_state_from_file(&path);
+                    }
+                }
+                if let Some(path) = actions.import_dump_path {
+                    let _ = self.import_state_from_file(&path);
                 }
 
                 // 7. GPU Render Pass

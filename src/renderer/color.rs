@@ -20,6 +20,21 @@ impl ColorMode {
             ColorMode::Hyperdimension => "Hyperdimension (4D-6D)",
         }
     }
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            ColorMode::Uniform => 0,
+            ColorMode::Hyperdimension => 1,
+        }
+    }
+
+    pub fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0 => Some(ColorMode::Uniform),
+            1 => Some(ColorMode::Hyperdimension),
+            _ => None,
+        }
+    }
 }
 
 /// JavaFX legacy dark blue: Color.DARKBLUE = #00008b
@@ -247,7 +262,7 @@ mod tests {
 
         // Position corresponding to (a=2, b=1, c=4, d=3, e=2, f=1)
         let x = 3 + 4 * stride; // 39
-        let y = 2 + 1 * stride; // 11
+        let y = 2 + stride; // 11
         let z = 1 + 2 * stride; // 19
 
         let color_direct = color_for_hypercoords(2, 1, 4, dim, size, ColorMode::Hyperdimension);

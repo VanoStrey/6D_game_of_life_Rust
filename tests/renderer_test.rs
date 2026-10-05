@@ -176,7 +176,7 @@ fn test_create_instances_with_coloring_uniform_and_hyperdimension() {
     // Two points in different 6D hypercubes:
     // point 0: (d=0, e=0, f=0, c=0, b=0, a=0) -> (0, 0, 0)
     // point 1: (d=0, e=0, f=0, c=2, b=1, a=3) -> (2*stride, 1*stride, 3*stride)
-    let positions = vec![(0, 0, 0), (2 * stride, 1 * stride, 3 * stride)];
+    let positions = vec![(0, 0, 0), (2 * stride, stride, 3 * stride)];
 
     // 1. Uniform mode -> all must have JAVA_DARK_BLUE
     let instances_uniform =
